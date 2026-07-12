@@ -55,7 +55,7 @@ usage: mss <path> [-v]
 ### 4.1 Path handling
 
 - Accept a single **file** or **directory**.
-- **Directories** are walked recursively; every file and subdirectory under the target is considered.
+- **Directories** are walked recursively; every file and subdirectory under the target is considered. Enumeration does **not** recurse into symlinks to directories (e.g. a Sparkle cache entry pointing at `/Applications`); symlink targets are still analysed when the symlink itself is enumerated.
 - Enumeration order is deterministic (child paths sorted alphabetically before recursion).
 - Paths are **normalized** when stored and joined (duplicate slashes collapsed;
   trailing-slash roots such as `/tmp/` must not produce `/tmp//…`).
@@ -107,7 +107,8 @@ These two entitlements are treated as **security findings**:
 
 In **default** mode, entitlements are reported only on **MH_EXECUTE** Mach-O
 binaries (not dylibs or other loadable images) when **both** dangerous
-entitlements are present, or when an **rpath** finding (§4.7) is also raised
+entitlements are present, or when an **rpath** (§4.7) or **relative-path**
+(§4.7.1), or **writable-libraries** (§4.7.2) finding is also raised
 on that binary; when entitlements are shown, **all** entitlement keys on that
 binary are listed (not only the dangerous ones). Dylibs may duplicate the
 app executable's entitlements but are not independently launched; skipping
@@ -162,6 +163,52 @@ dependencies; the header is red only when the risky `@rpath` + writable
 `LC_RPATH` combination above is present (the entitlement is not required for
 verbose listing).
 
+### 4.7.1 `@executable_path` and `@loader_path` dependency checks
+
+For Mach-O files, parse linked libraries whose install names start with
+`@executable_path` or `@loader_path`.
+
+A finding is raised when **all** of the following hold:
+
+- The binary links against at least one such library.
+- The executable has the
+  `com.apple.security.cs.disable-library-validation` entitlement (without it,
+  library validation blocks loading attacker-supplied libraries even when the
+  binary is copied to an attacker-controlled directory tree).
+
+Without library validation, an attacker who can place the executable in a
+chosen location can reconstruct the relative directory layout those install
+names resolve to and supply malicious dylibs.
+
+**Default** mode reports this only on **MH_EXECUTE** binaries. When a
+**relative-path** finding is raised, **all** entitlement keys on that
+executable are also listed (§4.5). **Verbose** mode lists `relative-path`
+data for any Mach-O with `@executable_path` and/or `@loader_path`
+dependencies; the header is red only when
+`disable-library-validation` is also present.
+
+### 4.7.2 Writable linked libraries
+
+For **MH_EXECUTE** Mach-O binaries (any Mach-O in verbose mode), resolve
+every linked library install name to a filesystem path:
+
+- Absolute paths are used as-is.
+- `@executable_path`, `@loader_path`, and `@rpath` prefixes are resolved
+  relative to the scanned binary (for `@rpath`, each `LC_RPATH` entry is
+  tried until an existing regular file is found).
+
+A finding is raised when at least one resolved library exists and is either
+**writable by others** (`S_IWOTH`) or **writable by the current user**
+(`access(2)` `W_OK`) through the group permission bits (`S_IWGRP`). Owner-only
+write permission alone is not flagged.
+
+Each flagged library is shown under a red **`writable-libraries`** header: the
+resolved path on one double-indented line, then a mode detail line
+(`<symbolic-mode> <octal> <owner:group>`). When a **writable-libraries**
+finding is raised in default mode, **all** entitlement keys on that executable
+are also listed when present (§4.5). **Verbose** mode uses the same rules;
+the header is red whenever at least one library matches.
+
 ### 4.8 Dangling symlink targets
 
 When a scanned symlink's target path does not exist:
@@ -178,9 +225,11 @@ creatable. **Verbose** mode reports all dangling symlinks.
 
 When the user passes a **symlink to a regular file** as the scan target, always
 report the symlink path, resolved target, and inode in default mode, then any
-other findings on the target. Symlinks discovered during directory walks are
-followed silently unless they have other findings or a dangling target.
-Directory symlink scan roots keep existing directory permission reporting.
+other findings on the target. Symlinks discovered during directory walks are analysed for findings on their
+targets (regular files, dangling links) but directory symlinks are not
+traversed recursively. Such symlinks are reported only when they have findings
+or a dangling target. Directory symlink scan roots keep existing directory
+permission reporting.
 
 ### 4.9 Scan-root symlink and directory permission checks
 
@@ -240,9 +289,11 @@ Skip the extra line when the resolved form is identical to the printed path.
 | `setuid` | Always (setuid bit set) |
 | `setgid` | Always (setgid bit set) |
 | `setuid, setgid` | Always (both bits set) |
-| `entitlements` | Both dangerous entitlements present (default), at least one (verbose), or any keys when `rpath` is flagged (default) |
+| `entitlements` | Both dangerous entitlements present (default), at least one (verbose), or any keys when `rpath`, `relative-path`, or `writable-libraries` is flagged (default) |
 | `entitlements` | Not red when only non-dangerous entitlements are listed |
 | `rpath` | `@rpath` dependency, writable-by-others `LC_RPATH`, and `disable-library-validation` (default); verbose omits entitlement requirement |
+| `relative-path` | `@executable_path` or `@loader_path` dependency and `disable-library-validation` |
+| `writable-libraries` | Resolved linked library writable by others or by the current user via group bits |
 | `creatable` | Dangling symlink target creatable by the current user |
 | `missing` | Not red — informational dangling symlink target |
 
@@ -265,6 +316,10 @@ Only print objects with **findings**:
 | `@rpath` deps with writable-by-others `LC_RPATH` and `disable-library-validation` on an executable | Yes — list **all** entitlement keys when present |
 | Risky `@rpath`/`LC_RPATH` without `disable-library-validation` | No (verbose: list rpath data) |
 | `LC_RPATH` without `@rpath` deps, or safe directories only | No |
+| `@executable_path` or `@loader_path` deps with `disable-library-validation` on an executable | Yes — list matching install names; list **all** entitlement keys when present |
+| `@executable_path` or `@loader_path` deps without `disable-library-validation` | No (verbose: list relative-path data) |
+| Writable linked library on an executable (others or group-writable to user) | Yes — resolved path and mode detail; list **all** entitlement keys when present |
+| Writable linked library (verbose, non-executable Mach-O) | Yes |
 | Dangling symlink with user-creatable target | Yes |
 | Dangling symlink target not creatable by user | No (verbose: yes, without `creatable`) |
 | Clean Mach-O (no dangerous entitlements, no setuid/setgid) | No |
@@ -287,8 +342,9 @@ flagged sections. Matching inodes indicate hard links to the same file.
 | Regular files | Yes — path, then setuid/setgid sections if applicable, then all entitlements if any |
 | Symlinks | Yes — path and `KIND: symlink` |
 | Mach-O metadata | `KIND: file` and `MACHO: yes` or `MACHO: no` (one tab indent) after sections |
+| Mach-O libraries | `libraries` section listing all linked dylib install names (from `LC_LOAD_DYLIB` and related load commands), one per double-indented line |
 
-Entitlements are **always** listed for Mach-O files that have them, regardless of whether dangerous flags are present. The `entitlements` header is red only when a dangerous flag is set.
+Entitlements are **always** listed for Mach-O files that have them, regardless of whether dangerous flags are present. The `entitlements` header is red only when a dangerous flag is set. The `libraries` header is never red.
 
 ### 5.5 Example (default, flagged Mach-O)
 

@@ -135,6 +135,8 @@ main() {
 	assert_contains "$out" "/bin/ls" t008
 	assert_not_contains "$out" $'\tentitlements' t008
 	assert_contains "$out" $'\tMACHO: yes' t008
+	assert_contains "$out" $'\tlibraries' t008
+	assert_contains "$out" $'\t\t/usr/lib/libSystem.B.dylib' t008
 
 	# t009 verbose safe entitlements (no dangerous flags)
 	out="$(run_case t009_verbose_safe 0 "$prog" "${FIXTURES}/with_safe_ent" -v)"
@@ -237,6 +239,37 @@ main() {
 	assert_contains "$out" \
 		'com.apple.security.cs.disable-library-validation' t016c
 
+	# t018 relative-path + disable-library-validation (default)
+	out="$(run_case t018_relpath 0 "$prog" "${FIXTURES}/with_relpath_lv")"
+	assert_contains "$out" "${FIXTURES}/with_relpath_lv" t018
+	assert_contains "$out" $'\trelative-path' t018
+	assert_contains "$out" '@executable_path/rel_framework/librel.dylib' t018
+	assert_contains "$out" $'\tentitlements' t018
+
+	# t018b relative-path without disable-library-validation (default: silent)
+	out="$(run_case t018b_relpath_no_lv 0 "$prog" "${FIXTURES}/with_relpath")"
+	assert_not_contains "$out" $'\trelative-path' t018b
+
+	# t018c relative-path without disable-library-validation (verbose)
+	out="$(run_case t018c_relpath_verbose 0 "$prog" \
+		"${FIXTURES}/with_relpath" -v)"
+	assert_contains "$out" $'\trelative-path' t018c
+	assert_contains "$out" '@executable_path/rel_framework/librel.dylib' t018c
+
+	# t019 writable linked library (default)
+	out="$(run_case t019_writable_lib 0 "$prog" \
+		"${FIXTURES}/with_writable_lib")"
+	assert_contains "$out" "${FIXTURES}/with_writable_lib" t019
+	assert_contains "$out" $'\twritable-libraries' t019
+	assert_contains "$out" 'writable_lib/libw.dylib' t019
+	assert_contains "$out" '0777' t019
+
+	# t019b relpath_lv also has world-writable resolved library
+	out="$(run_case t019b_relpath_writable 0 "$prog" \
+		"${FIXTURES}/with_relpath_lv")"
+	assert_contains "$out" $'\twritable-libraries' t019b
+	assert_contains "$out" 'rel_framework/librel.dylib' t019b
+
 	# t013 writable-by-others without sticky bit (default)
 	out="$(run_case t013_unsafe_dir 0 "$prog" "${FIXTURES}/unsafe_dir")"
 	assert_contains "$out" "${FIXTURES}/unsafe_dir" t013
@@ -255,6 +288,14 @@ main() {
 	assert_contains "$out" $'\tdirectory permissions' t015
 	assert_not_contains "$out" $'\tsticky bit' t015
 	assert_contains "$out" $'\t\tdrwxrwxrwt 1777' t015
+
+	# t020 directory symlink must not recurse outside scan tree
+	out="$(run_case t020_escape_symlink_dir 0 "$prog" \
+		"${FIXTURES}/escape_walk/scan_here")"
+	assert_not_contains "$out" \
+		"${FIXTURES}/escape_walk/outside/with_both_ent" t020
+	assert_not_contains "$out" \
+		'com.apple.security.cs.allow-dyld-environment-variables' t020
 
 	printf 'PASS functional\n'
 }

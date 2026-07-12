@@ -65,11 +65,31 @@ main() {
 	cp "${OUT}/with_rpath_missing" "${OUT}/with_rpath_missing_lv"
 	codesign -s - --entitlements "${SRC}/ent_lv.plist" \
 		"${OUT}/with_rpath_missing_lv"
+	mkdir -p "${OUT}/rel_framework"
+	cc -std=c17 -Wall -Wextra -Werror -dynamiclib \
+		-install_name '@executable_path/rel_framework/librel.dylib' \
+		-o "${OUT}/rel_framework/librel.dylib" "$hello_c"
+	cc -std=c17 -Wall -Wextra -Werror -o "${OUT}/with_relpath" "$hello_c" \
+		-L"${OUT}/rel_framework" -lrel
+	cp "${OUT}/with_relpath" "${OUT}/with_relpath_lv"
+	codesign -s - --entitlements "${SRC}/ent_lv.plist" \
+		"${OUT}/with_relpath_lv"
+	chmod 0777 "${OUT}/rel_framework/librel.dylib"
+	mkdir -p "${OUT}/writable_lib"
+	cc -std=c17 -Wall -Wextra -Werror -dynamiclib \
+		-install_name '@executable_path/writable_lib/libw.dylib' \
+		-o "${OUT}/writable_lib/libw.dylib" "$hello_c"
+	chmod 0777 "${OUT}/writable_lib/libw.dylib"
+	cc -std=c17 -Wall -Wextra -Werror -o "${OUT}/with_writable_lib" \
+		"$hello_c" -L"${OUT}/writable_lib" -lw
 	ln -sfn "does/not/exist" "${OUT}/dangle_link"
 	mkdir -p "${OUT}/dotdot_tree/sub"
 	chmod 0777 "${OUT}/dotdot_tree"
 	ln -sfn "sub/../dotdot_tree/noexist" "${OUT}/dotdot_link"
 	ln -sfn unsigned "${OUT}/link_unsigned"
+	mkdir -p "${OUT}/escape_walk/outside" "${OUT}/escape_walk/scan_here"
+	cp "${OUT}/with_both_ent" "${OUT}/escape_walk/outside/with_both_ent"
+	ln -sfn ../outside "${OUT}/escape_walk/scan_here/escape"
 }
 
 main "$@"

@@ -10,6 +10,7 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -663,7 +664,20 @@ macho_rpath_info_free(macho_rpath_info_t *info)
 	for (i = 0; i < info->deps.count; i++)
 		free(info->deps.items[i]);
 	free(info->deps.items);
+	for (i = 0; i < info->relpaths.count; i++)
+		free(info->relpaths.items[i]);
+	free(info->relpaths.items);
 	memset(info, 0, sizeof(*info));
+}
+
+static int
+macho_is_relpath_dep(const char *str)
+{
+	if (strncmp(str, "@executable_path", 16) == 0)
+		return (1);
+	if (strncmp(str, "@loader_path", 12) == 0)
+		return (1);
+	return (0);
 }
 
 static int
@@ -762,6 +776,9 @@ macho_rpath_from_slice(const uint8_t *slice, size_t slice_len,
 			if (strncmp(str, "@rpath/", 7) == 0) {
 				if (macho_strlist_push(&out->deps, str) != 0)
 					return (-1);
+			} else if (macho_is_relpath_dep(str)) {
+				if (macho_strlist_push(&out->relpaths, str) != 0)
+					return (-1);
 			}
 		}
 		off += cmdsize;
@@ -780,6 +797,11 @@ macho_merge_rpath_info(macho_rpath_info_t *dst, const macho_rpath_info_t *src)
 	}
 	for (i = 0; i < src->deps.count; i++) {
 		if (macho_strlist_push(&dst->deps, src->deps.items[i]) != 0)
+			return (-1);
+	}
+	for (i = 0; i < src->relpaths.count; i++) {
+		if (macho_strlist_push(&dst->relpaths, src->relpaths.items[i]) !=
+		    0)
 			return (-1);
 	}
 	return (0);
@@ -812,7 +834,8 @@ macho_rpath_info_for_path(const char *path, macho_rpath_info_t *out)
 			macho_rpath_info_free(out);
 			return (-1);
 		}
-		return (out->rpaths.count > 0 || out->deps.count > 0 ? 1 : 0);
+		return (out->rpaths.count > 0 || out->deps.count > 0 ||
+		    out->relpaths.count > 0 ? 1 : 0);
 	}
 	if (!macho_magic_is_fat(magic)) {
 		free(data);
@@ -855,5 +878,165 @@ macho_rpath_info_for_path(const char *path, macho_rpath_info_t *out)
 		macho_rpath_info_free(&slice_info);
 	}
 	free(data);
-	return (out->rpaths.count > 0 || out->deps.count > 0 ? 1 : 0);
+	return (out->rpaths.count > 0 || out->deps.count > 0 ||
+	    out->relpaths.count > 0 ? 1 : 0);
+}
+
+void
+macho_libs_free(macho_strlist_t *libs)
+{
+	size_t	i;
+
+	if (libs == NULL)
+		return;
+	for (i = 0; i < libs->count; i++)
+		free(libs->items[i]);
+	free(libs->items);
+	memset(libs, 0, sizeof(*libs));
+}
+
+static int
+macho_libs_from_slice(const uint8_t *slice, size_t slice_len,
+    macho_strlist_t *out)
+{
+	uint32_t	cmd;
+	uint32_t	cmdsize;
+	uint32_t	hdrsize;
+	uint32_t	magic;
+	uint32_t	name_off;
+	uint32_t	ncmds;
+	char		str[PATH_MAX];
+	size_t		off;
+	int		is64;
+	int		swap;
+
+	if (slice_len < sizeof(uint32_t))
+		return (0);
+	memcpy(&magic, slice, sizeof(magic));
+	if (!macho_magic_is_thin(magic))
+		return (0);
+	swap = macho_slice_swapped(magic);
+	is64 = macho_slice_is_64(magic);
+	hdrsize = is64 ? sizeof(struct macho_header_64) :
+	    sizeof(struct macho_header_32);
+	if (slice_len < hdrsize)
+		return (0);
+	if (is64) {
+		memcpy(&ncmds, slice + offsetof(struct macho_header_64, ncmds),
+		    sizeof(ncmds));
+	} else {
+		memcpy(&ncmds, slice + offsetof(struct macho_header_32, ncmds),
+		    sizeof(ncmds));
+	}
+	ncmds = macho_swap32(ncmds, swap);
+	off = hdrsize;
+	for (uint32_t i = 0; i < ncmds; i++) {
+		if (off + sizeof(struct macho_load_command) > slice_len)
+			return (0);
+		memcpy(&cmd, slice + off, sizeof(cmd));
+		memcpy(&cmdsize, slice + off + sizeof(uint32_t),
+		    sizeof(cmdsize));
+		cmd = macho_swap32(cmd, swap);
+		cmdsize = macho_swap32(cmdsize, swap);
+		if (cmdsize < sizeof(struct macho_load_command) ||
+		    off + cmdsize > slice_len)
+			return (0);
+		if (macho_slice_is_dylib_load(cmd)) {
+			memcpy(&name_off, slice + off + 2 * sizeof(uint32_t),
+			    sizeof(name_off));
+			name_off = macho_swap32(name_off, swap);
+			if (macho_lc_string(slice, slice_len, off, name_off,
+			    cmdsize, str, sizeof(str)) != 0)
+				return (-1);
+			if (macho_strlist_push(out, str) != 0)
+				return (-1);
+		}
+		off += cmdsize;
+	}
+	return (1);
+}
+
+static int
+macho_merge_libs(macho_strlist_t *dst, const macho_strlist_t *src)
+{
+	size_t	i;
+
+	for (i = 0; i < src->count; i++) {
+		if (macho_strlist_push(dst, src->items[i]) != 0)
+			return (-1);
+	}
+	return (0);
+}
+
+int
+macho_libs_for_path(const char *path, macho_strlist_t *out)
+{
+	macho_strlist_t	slice_libs;
+	uint8_t		*data;
+	size_t		len;
+	uint32_t	magic;
+	uint32_t	nfat;
+	int		rc;
+	int		swap;
+	size_t		i;
+
+	memset(out, 0, sizeof(*out));
+	if (macho_read_file(path, &data, &len) != 0)
+		return (-1);
+	if (len < sizeof(uint32_t)) {
+		free(data);
+		return (0);
+	}
+	memcpy(&magic, data, sizeof(magic));
+	if (macho_magic_is_thin(magic)) {
+		rc = macho_libs_from_slice(data, len, out);
+		free(data);
+		if (rc < 0) {
+			macho_libs_free(out);
+			return (-1);
+		}
+		return (out->count > 0 ? 1 : 0);
+	}
+	if (!macho_magic_is_fat(magic)) {
+		free(data);
+		return (0);
+	}
+	swap = (magic == MACHO_FAT_MAGIC_SWAPPED);
+	memcpy(&nfat, data + sizeof(uint32_t), sizeof(nfat));
+	nfat = macho_swap32(nfat, swap);
+	for (i = 0; i < nfat; i++) {
+		const struct macho_fat_arch	*arch;
+		uint32_t			 offset;
+		uint32_t			 size;
+
+		if (sizeof(struct macho_fat_header) +
+		    (i + 1) * sizeof(struct macho_fat_arch) > len)
+			break;
+		arch = (const struct macho_fat_arch *)(data +
+		    sizeof(struct macho_fat_header) +
+		    i * sizeof(struct macho_fat_arch));
+		offset = macho_swap32(arch->offset, swap);
+		size = macho_swap32(arch->size, swap);
+		if ((size_t)offset + (size_t)size > len)
+			continue;
+		memset(&slice_libs, 0, sizeof(slice_libs));
+		rc = macho_libs_from_slice(data + offset, size, &slice_libs);
+		if (rc < 0) {
+			macho_libs_free(&slice_libs);
+			macho_libs_free(out);
+			free(data);
+			return (-1);
+		}
+		if (rc > 0) {
+			if (macho_merge_libs(out, &slice_libs) != 0) {
+				macho_libs_free(&slice_libs);
+				macho_libs_free(out);
+				free(data);
+				return (-1);
+			}
+		}
+		macho_libs_free(&slice_libs);
+	}
+	free(data);
+	return (out->count > 0 ? 1 : 0);
 }

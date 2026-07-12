@@ -50,6 +50,7 @@ typedef struct macho_strlist {
 typedef struct macho_rpath_info {
 	macho_strlist_t	rpaths;
 	macho_strlist_t	deps;
+	macho_strlist_t	relpaths;
 } macho_rpath_info_t;
 
 int macho_kind_of(const char *, macho_kind_t *);
@@ -60,6 +61,8 @@ int macho_entitlements_for_slice(const uint8_t *, size_t,
 void macho_entitlements_free(macho_entitlements_t *);
 int macho_rpath_info_for_path(const char *, macho_rpath_info_t *);
 void macho_rpath_info_free(macho_rpath_info_t *);
+int macho_libs_for_path(const char *, macho_strlist_t *);
+void macho_libs_free(macho_strlist_t *);
 
 #ifdef __cplusplus
 }

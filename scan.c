@@ -300,7 +300,9 @@ scan_walk(const char *path, int verbose, int is_root, const char *root_path)
 	report = is_root ? root_path : path;
 	if (scan_object(report, verbose, is_root))
 		printf("\n");
-	if (stat(path, &st) != 0)
+	if (lstat(path, &st) != 0)
+		return (0);
+	if (S_ISLNK(st.st_mode))
 		return (0);
 	if (!S_ISDIR(st.st_mode))
 		return (0);
@@ -491,6 +493,32 @@ scan_format_mode(mode_t mode, char *buf, size_t buflen)
 	    ((mode & S_ISVTX) ? 'T' : '-'));
 }
 
+static void
+scan_format_owner(uid_t uid, char *buf, size_t len)
+{
+	struct passwd	*pw;
+
+	pw = getpwuid(uid);
+	if (pw != NULL && pw->pw_name != NULL) {
+		strlcpy(buf, pw->pw_name, len);
+		return;
+	}
+	snprintf(buf, len, "%lu", (unsigned long)uid);
+}
+
+static void
+scan_format_group(gid_t gid, char *buf, size_t len)
+{
+	struct group	*gr;
+
+	gr = getgrgid(gid);
+	if (gr != NULL && gr->gr_name != NULL) {
+		strlcpy(buf, gr->gr_name, len);
+		return;
+	}
+	snprintf(buf, len, "%lu", (unsigned long)gid);
+}
+
 static int
 scan_has_setid(const struct stat *st)
 {
@@ -507,10 +535,10 @@ scan_has_world_writable(const struct stat *st)
 static void
 scan_print_setid_details(const struct stat *st)
 {
-	struct group	*gr;
-	struct passwd	*pw;
 	char		detail[256];
+	char		group[64];
 	char		modebuf[16];
+	char		owner[64];
 	int		has_sgid;
 	int		has_suid;
 	mode_t		perms;
@@ -527,17 +555,15 @@ scan_print_setid_details(const struct stat *st)
 		scan_print_flag_header("setgid", 1);
 	scan_format_mode(st->st_mode, modebuf, sizeof(modebuf));
 	perms = st->st_mode & 07777;
-	pw = getpwuid(st->st_uid);
-	gr = getgrgid(st->st_gid);
+	scan_format_owner(st->st_uid, owner, sizeof(owner));
+	scan_format_group(st->st_gid, group, sizeof(group));
 	snprintf(detail, sizeof(detail), "%s %04lo %s:%s",
-	    modebuf, (unsigned long)perms,
-	    pw != NULL ? pw->pw_name : "?",
-	    gr != NULL ? gr->gr_name : "?");
+	    modebuf, (unsigned long)perms, owner, group);
 	printf("\t\t%s\n", detail);
 }
 
 static int
-scan_entitlements_findings(const char *path, int verbose, int rpath_flagged,
+scan_entitlements_findings(const char *path, int verbose, int load_flagged,
     plist_keys_t *keys_out)
 {
 	macho_entitlements_t	ent;
@@ -568,7 +594,7 @@ scan_entitlements_findings(const char *path, int verbose, int rpath_flagged,
 		return (keys_out->count > 0);
 	if (has_dyld && has_lv)
 		return (1);
-	if (rpath_flagged && keys_out->count > 0)
+	if (load_flagged && keys_out->count > 0)
 		return (1);
 	plist_keys_free(keys_out);
 	return (0);
@@ -587,6 +613,64 @@ scan_dirname_last(char *path)
 		return (0);
 	}
 	*slash = '\0';
+	return (0);
+}
+
+typedef struct scan_writable_lib {
+	char		resolved[PATH_MAX];
+	struct stat	st;
+} scan_writable_lib_t;
+
+typedef struct scan_writable_libs {
+	scan_writable_lib_t	*items;
+	size_t			 count;
+} scan_writable_libs_t;
+
+static void
+scan_writable_libs_free(scan_writable_libs_t *libs)
+{
+	if (libs == NULL)
+		return;
+	free(libs->items);
+	memset(libs, 0, sizeof(*libs));
+}
+
+static int
+scan_writable_libs_push(scan_writable_libs_t *libs, const char *resolved,
+    const struct stat *st)
+{
+	scan_writable_lib_t	*grown;
+	size_t			i;
+
+	for (i = 0; i < libs->count; i++) {
+		if (strcmp(libs->items[i].resolved, resolved) == 0)
+			return (0);
+	}
+	grown = realloc(libs->items,
+	    (libs->count + 1) * sizeof(*grown));
+	if (grown == NULL)
+		return (-1);
+	libs->items = grown;
+	libs->items[libs->count].st = *st;
+	if (strlcpy(libs->items[libs->count].resolved, resolved,
+	    sizeof(libs->items[libs->count].resolved)) >=
+	    sizeof(libs->items[libs->count].resolved))
+		return (-1);
+	libs->count++;
+	return (0);
+}
+
+static int
+scan_lib_is_risky(const char *path, const struct stat *st)
+{
+	if (!S_ISREG(st->st_mode))
+		return (0);
+	if ((st->st_mode & S_IWOTH) != 0)
+		return (1);
+	if (access(path, W_OK) != 0)
+		return (0);
+	if ((st->st_mode & S_IWGRP) != 0)
+		return (1);
 	return (0);
 }
 
@@ -614,6 +698,84 @@ scan_rpath_resolve(const char *rpath, const char *macho_path, char *out,
 		return (-1);
 	scan_collapse_slashes(out);
 	return (0);
+}
+
+static int
+scan_lib_resolve(const char *name, const char *macho_path,
+    const macho_rpath_info_t *rpath_info, char *out, size_t outlen)
+{
+	char		base[PATH_MAX];
+	char		rest[PATH_MAX];
+	struct stat	st;
+	size_t		i;
+
+	if (strncmp(name, "@rpath/", 7) == 0) {
+		if (rpath_info == NULL)
+			return (-1);
+		if (strlcpy(rest, name + 7, sizeof(rest)) >= sizeof(rest))
+			return (-1);
+		for (i = 0; i < rpath_info->rpaths.count; i++) {
+			if (scan_rpath_resolve(rpath_info->rpaths.items[i],
+			    macho_path, base, sizeof(base)) != 0)
+				continue;
+			if (snprintf(out, outlen, "%s/%s", base, rest) >=
+			    (int)outlen)
+				continue;
+			scan_collapse_slashes(out);
+			if (stat(out, &st) == 0 && S_ISREG(st.st_mode))
+				return (0);
+		}
+		return (-1);
+	}
+	if (scan_rpath_resolve(name, macho_path, out, outlen) != 0)
+		return (-1);
+	if (stat(out, &st) != 0 || !S_ISREG(st.st_mode))
+		return (-1);
+	return (0);
+}
+
+static int
+scan_lib_findings(const char *path, int verbose,
+    const macho_rpath_info_t *load_info, scan_writable_libs_t *out,
+    int *flagged)
+{
+	macho_filetype_t	ftype;
+	macho_strlist_t		libs;
+	char			resolved[PATH_MAX];
+	struct stat		st;
+	size_t			i;
+
+	memset(out, 0, sizeof(*out));
+	*flagged = 0;
+	if (!verbose) {
+		if (macho_filetype_of(path, &ftype) != 0 ||
+		    ftype != MACHO_FILE_EXECUTE)
+			return (0);
+	}
+	memset(&libs, 0, sizeof(libs));
+	if (macho_libs_for_path(path, &libs) <= 0) {
+		macho_libs_free(&libs);
+		return (0);
+	}
+	for (i = 0; i < libs.count; i++) {
+		if (scan_lib_resolve(libs.items[i], path, load_info, resolved,
+		    sizeof(resolved)) != 0)
+			continue;
+		if (stat(resolved, &st) != 0 || !S_ISREG(st.st_mode))
+			continue;
+		if (!scan_lib_is_risky(resolved, &st))
+			continue;
+		if (scan_writable_libs_push(out, resolved, &st) != 0) {
+			macho_libs_free(&libs);
+			scan_writable_libs_free(out);
+			return (-1);
+		}
+	}
+	macho_libs_free(&libs);
+	if (out->count == 0)
+		return (0);
+	*flagged = 1;
+	return (1);
 }
 
 static int
@@ -676,42 +838,52 @@ scan_has_entitlement(const char *path, const char *key)
 }
 
 static int
-scan_rpath_findings(const char *path, int verbose, macho_rpath_info_t *info,
-    int *flagged)
+scan_load_findings(const char *path, int verbose, macho_rpath_info_t *info,
+    int *rpath_findings, int *rpath_flagged, int *relpath_findings,
+    int *relpath_flagged)
 {
 	macho_filetype_t	ftype;
+	int			has_lv;
 	int			has_risky;
+	int			is_execute;
 
 	memset(info, 0, sizeof(*info));
-	*flagged = 0;
+	*rpath_findings = 0;
+	*rpath_flagged = 0;
+	*relpath_findings = 0;
+	*relpath_flagged = 0;
+	is_execute = 1;
 	if (!verbose) {
 		if (macho_filetype_of(path, &ftype) != 0 ||
 		    ftype != MACHO_FILE_EXECUTE)
-			return (0);
+			is_execute = 0;
 	}
 	if (macho_rpath_info_for_path(path, info) <= 0)
 		return (0);
-	if (info->deps.count == 0) {
-		if (!verbose || info->rpaths.count == 0) {
-			macho_rpath_info_free(info);
-			return (0);
+	has_risky = scan_rpath_has_risky(path, info);
+	has_lv = scan_has_entitlement(path, ENT_DISABLE_LV);
+	if (verbose) {
+		if (info->rpaths.count > 0 || info->deps.count > 0) {
+			*rpath_findings = 1;
+			*rpath_flagged = (info->deps.count > 0 && has_risky);
+		}
+	} else if (is_execute && info->deps.count > 0 && has_risky && has_lv) {
+		*rpath_findings = 1;
+		*rpath_flagged = 1;
+	}
+	if (info->relpaths.count > 0) {
+		if (verbose) {
+			*relpath_findings = 1;
+			*relpath_flagged = has_lv;
+		} else if (is_execute && has_lv) {
+			*relpath_findings = 1;
+			*relpath_flagged = 1;
 		}
 	}
-	has_risky = scan_rpath_has_risky(path, info);
-	if (verbose) {
-		*flagged = (info->deps.count > 0 && has_risky);
-		return (info->rpaths.count > 0 || info->deps.count > 0);
-	}
-	if (info->deps.count == 0 || !has_risky) {
-		macho_rpath_info_free(info);
-		return (0);
-	}
-	if (!scan_has_entitlement(path, ENT_DISABLE_LV)) {
-		macho_rpath_info_free(info);
-		return (0);
-	}
-	*flagged = 1;
-	return (1);
+	if (*rpath_findings || *relpath_findings)
+		return (1);
+	macho_rpath_info_free(info);
+	return (0);
 }
 
 static void
@@ -729,20 +901,18 @@ scan_print_entitlements_list(const plist_keys_t *keys, int flagged)
 static void
 scan_print_mode_detail(const struct stat *st)
 {
-	struct group	*gr;
-	struct passwd	*pw;
 	char		detail[256];
+	char		group[64];
 	char		modebuf[16];
+	char		owner[64];
 	mode_t		perms;
 
 	scan_format_mode(st->st_mode, modebuf, sizeof(modebuf));
 	perms = st->st_mode & 07777;
-	pw = getpwuid(st->st_uid);
-	gr = getgrgid(st->st_gid);
+	scan_format_owner(st->st_uid, owner, sizeof(owner));
+	scan_format_group(st->st_gid, group, sizeof(group));
 	snprintf(detail, sizeof(detail), "%s %04lo %s:%s",
-	    modebuf, (unsigned long)perms,
-	    pw != NULL ? pw->pw_name : "?",
-	    gr != NULL ? gr->gr_name : "?");
+	    modebuf, (unsigned long)perms, owner, group);
 	printf("\t\t%s\n", detail);
 }
 
@@ -751,6 +921,34 @@ scan_print_world_writable(const struct stat *st)
 {
 	scan_print_flag_header("writable-by-others", 1);
 	scan_print_mode_detail(st);
+}
+
+static void
+scan_print_writable_lib(const char *path, const struct stat *st)
+{
+	char	display[PATH_MAX];
+	const char	*shown;
+
+	if (realpath(path, display) != NULL)
+		shown = display;
+	else
+		shown = path;
+	printf("\t\t%s\n", shown);
+	scan_print_resolved_path_line(shown, "\t\t");
+	scan_print_mode_detail(st);
+}
+
+static void
+scan_print_writable_libs_list(const scan_writable_libs_t *libs, int flagged)
+{
+	size_t	i;
+
+	if (libs->count == 0)
+		return;
+	scan_print_flag_header("writable-libraries", flagged);
+	for (i = 0; i < libs->count; i++)
+		scan_print_writable_lib(libs->items[i].resolved,
+		    &libs->items[i].st);
 }
 
 static void
@@ -873,16 +1071,16 @@ scan_creatable_parent(const char *target, char *parent, size_t parentlen,
 	for (;;) {
 		if (access(path, F_OK) == 0) {
 			if (access(path, W_OK) != 0)
-				return (0);
+				return (-1);
 			if (stat(path, st) != 0)
-				return (0);
+				return (-1);
 			return (strlcpy(parent, path, parentlen) < parentlen ?
 			    0 : -1);
 		}
 		if (errno != ENOENT)
-			return (0);
+			return (-1);
 		if (scan_dirname_last(path) != 0)
-			return (0);
+			return (-1);
 	}
 }
 
@@ -907,18 +1105,18 @@ scan_print_missing_target(const char *target)
 static void
 scan_print_creatable_parent_detail(const char *parent, const struct stat *st)
 {
-	struct group	*gr;
-	struct passwd	*pw;
 	char		detail[PATH_MAX + 64];
+	char		group[64];
 	char		modebuf[16];
+	char		owner[64];
 	char		resolved[PATH_MAX];
 	const char	*detail_path;
 	mode_t		perms;
 
 	scan_format_mode(st->st_mode, modebuf, sizeof(modebuf));
 	perms = st->st_mode & 07777;
-	pw = getpwuid(st->st_uid);
-	gr = getgrgid(st->st_gid);
+	scan_format_owner(st->st_uid, owner, sizeof(owner));
+	scan_format_group(st->st_gid, group, sizeof(group));
 	detail_path = parent;
 	if (scan_path_needs_resolve(parent) &&
 	    scan_path_display_resolve(parent, resolved, sizeof(resolved)) == 0 &&
@@ -927,9 +1125,7 @@ scan_print_creatable_parent_detail(const char *parent, const struct stat *st)
 		detail_path = resolved;
 	}
 	snprintf(detail, sizeof(detail), "%s %s %04lo %s:%s",
-	    detail_path, modebuf, (unsigned long)perms,
-	    pw != NULL ? pw->pw_name : "?",
-	    gr != NULL ? gr->gr_name : "?");
+	    detail_path, modebuf, (unsigned long)perms, owner, group);
 	printf("\t\t%s\n", detail);
 }
 
@@ -954,6 +1150,51 @@ scan_rpath_entry_risky(const char *rpath, const char *macho_path,
 	if (scan_rpath_resolve(rpath, macho_path, resolved, reslen) != 0)
 		return (0);
 	return (scan_rpath_dir_risky(resolved));
+}
+
+static void
+scan_print_libs_list(const macho_strlist_t *libs)
+{
+	size_t	i;
+
+	if (libs->count == 0)
+		return;
+	scan_print_flag_header("libraries", 0);
+	for (i = 0; i < libs->count; i++)
+		printf("\t\t%s\n", libs->items[i]);
+}
+
+static void
+scan_print_verbose_file_meta(const char *path)
+{
+	macho_kind_t		mkind;
+	macho_strlist_t		libs;
+
+	if (macho_kind_of(path, &mkind) != 0)
+		mkind = MACHO_KIND_NONE;
+	if (mkind != MACHO_KIND_NONE) {
+		memset(&libs, 0, sizeof(libs));
+		if (macho_libs_for_path(path, &libs) > 0)
+			scan_print_libs_list(&libs);
+		macho_libs_free(&libs);
+	}
+	printf("\tKIND: file\n");
+	if (mkind == MACHO_KIND_NONE)
+		printf("\tMACHO: no\n");
+	else
+		printf("\tMACHO: yes\n");
+}
+
+static void
+scan_print_relpath_list(const macho_rpath_info_t *info, int flagged)
+{
+	size_t	i;
+
+	if (info->relpaths.count == 0)
+		return;
+	scan_print_flag_header("relative-path", flagged);
+	for (i = 0; i < info->relpaths.count; i++)
+		printf("\t\t%s\n", info->relpaths.items[i]);
 }
 
 static void
@@ -1021,13 +1262,18 @@ scan_print_symlink_lines(const char *path, const char *target)
 static int
 scan_file_findings(const char *path, int verbose, const struct stat *st)
 {
-	macho_kind_t		mkind;
-	macho_rpath_info_t	rpath_info;
+	macho_rpath_info_t	load_info;
 	plist_keys_t		keys;
+	scan_writable_libs_t	writable_libs;
 	int			ent_flagged;
 	int			ent_findings;
 	int			has_findings;
 	int			has_setid;
+	int			lib_findings;
+	int			lib_flagged;
+	int			load_flagged;
+	int			relpath_findings;
+	int			relpath_flagged;
 	int			rpath_findings;
 	int			rpath_flagged;
 	int			world_writable;
@@ -1035,11 +1281,14 @@ scan_file_findings(const char *path, int verbose, const struct stat *st)
 	has_findings = 0;
 	has_setid = scan_has_setid(st);
 	world_writable = scan_has_world_writable(st);
-	rpath_findings = scan_rpath_findings(path, verbose, &rpath_info,
-	    &rpath_flagged);
-	ent_findings = scan_entitlements_findings(path, verbose, rpath_flagged,
+	scan_load_findings(path, verbose, &load_info, &rpath_findings,
+	    &rpath_flagged, &relpath_findings, &relpath_flagged);
+	lib_findings = scan_lib_findings(path, verbose, &load_info,
+	    &writable_libs, &lib_flagged);
+	load_flagged = rpath_flagged || relpath_flagged || lib_flagged;
+	ent_findings = scan_entitlements_findings(path, verbose, load_flagged,
 	    &keys);
-	if (verbose || rpath_flagged)
+	if (verbose || load_flagged)
 		ent_flagged = plist_keys_has(&keys, ENT_ALLOW_DYLD) ||
 		    plist_keys_has(&keys, ENT_DISABLE_LV);
 	else
@@ -1053,18 +1302,17 @@ scan_file_findings(const char *path, int verbose, const struct stat *st)
 		has_findings = 1;
 	if (rpath_findings)
 		has_findings = 1;
+	if (relpath_findings)
+		has_findings = 1;
+	if (lib_findings)
+		has_findings = 1;
 	if (!has_findings) {
 		plist_keys_free(&keys);
-		macho_rpath_info_free(&rpath_info);
+		macho_rpath_info_free(&load_info);
+		scan_writable_libs_free(&writable_libs);
 		if (!verbose)
 			return (0);
-		if (macho_kind_of(path, &mkind) != 0)
-			mkind = MACHO_KIND_NONE;
-		printf("\tKIND: file\n");
-		if (mkind == MACHO_KIND_NONE)
-			printf("\tMACHO: no\n");
-		else
-			printf("\tMACHO: yes\n");
+		scan_print_verbose_file_meta(path);
 		return (1);
 	}
 	scan_print_setid_details(st);
@@ -1073,18 +1321,16 @@ scan_file_findings(const char *path, int verbose, const struct stat *st)
 	if (ent_findings)
 		scan_print_entitlements_list(&keys, ent_flagged);
 	if (rpath_findings)
-		scan_print_rpath_list(&rpath_info, path, verbose, rpath_flagged);
+		scan_print_rpath_list(&load_info, path, verbose, rpath_flagged);
+	if (relpath_findings)
+		scan_print_relpath_list(&load_info, relpath_flagged);
+	if (lib_findings)
+		scan_print_writable_libs_list(&writable_libs, lib_flagged);
 	plist_keys_free(&keys);
-	macho_rpath_info_free(&rpath_info);
-	if (verbose) {
-		if (macho_kind_of(path, &mkind) != 0)
-			mkind = MACHO_KIND_NONE;
-		printf("\tKIND: file\n");
-		if (mkind == MACHO_KIND_NONE)
-			printf("\tMACHO: no\n");
-		else
-			printf("\tMACHO: yes\n");
-	}
+	macho_rpath_info_free(&load_info);
+	scan_writable_libs_free(&writable_libs);
+	if (verbose)
+		scan_print_verbose_file_meta(path);
 	return (1);
 }
 
@@ -1147,14 +1393,20 @@ scan_stat_file(const char *path, struct stat *st)
 static int
 scan_file(const char *path, int verbose)
 {
-	macho_rpath_info_t	rpath_info;
+	macho_rpath_info_t	load_info;
 	plist_keys_t		keys;
+	scan_writable_libs_t	writable_libs;
 	struct stat		lst;
 	struct stat		st;
 	int			ent_findings;
 	int			has_findings;
 	int			has_setid;
 	int			is_symlink;
+	int			lib_findings;
+	int			lib_flagged;
+	int			load_flagged;
+	int			relpath_findings;
+	int			relpath_flagged;
 	int			rpath_findings;
 	int			rpath_flagged;
 	int			world_writable;
@@ -1166,14 +1418,18 @@ scan_file(const char *path, int verbose)
 		return (0);
 	has_setid = scan_has_setid(&st);
 	world_writable = scan_has_world_writable(&st);
-	rpath_findings = scan_rpath_findings(path, verbose, &rpath_info,
-	    &rpath_flagged);
-	ent_findings = scan_entitlements_findings(path, verbose, rpath_flagged,
+	scan_load_findings(path, verbose, &load_info, &rpath_findings,
+	    &rpath_flagged, &relpath_findings, &relpath_flagged);
+	lib_findings = scan_lib_findings(path, verbose, &load_info,
+	    &writable_libs, &lib_flagged);
+	load_flagged = rpath_flagged || relpath_flagged || lib_flagged;
+	ent_findings = scan_entitlements_findings(path, verbose, load_flagged,
 	    &keys);
 	plist_keys_free(&keys);
-	macho_rpath_info_free(&rpath_info);
+	macho_rpath_info_free(&load_info);
+	scan_writable_libs_free(&writable_libs);
 	has_findings = verbose || has_setid || world_writable || ent_findings ||
-	    rpath_findings;
+	    rpath_findings || relpath_findings || lib_findings;
 	if (!has_findings)
 		return (0);
 	scan_print_path_lines(path, is_symlink);

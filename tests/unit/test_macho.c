@@ -129,6 +129,42 @@ test_rpath_info(void)
 }
 
 static int
+test_relpath_info(void)
+{
+	macho_rpath_info_t info;
+	char path[512];
+
+	snprintf(path, sizeof(path), "%s/with_relpath", FIXTURES);
+	memset(&info, 0, sizeof(info));
+	TEST_ASSERT(macho_rpath_info_for_path(path, &info) == 1);
+	TEST_ASSERT(info.relpaths.count == 1);
+	TEST_ASSERT(strstr(info.relpaths.items[0],
+	    "@executable_path/rel_framework/librel.dylib") != NULL);
+	macho_rpath_info_free(&info);
+	return (0);
+}
+
+static int
+test_libs_system(void)
+{
+	macho_strlist_t	libs;
+	size_t		i;
+	int		found;
+
+	memset(&libs, 0, sizeof(libs));
+	TEST_ASSERT(macho_libs_for_path("/bin/ls", &libs) == 1);
+	TEST_ASSERT(libs.count >= 3);
+	found = 0;
+	for (i = 0; i < libs.count; i++) {
+		if (strcmp(libs.items[i], "/usr/lib/libSystem.B.dylib") == 0)
+			found = 1;
+	}
+	TEST_ASSERT(found);
+	macho_libs_free(&libs);
+	return (0);
+}
+
+static int
 test_filetype_dylib(void)
 {
 	macho_filetype_t ftype;
@@ -158,6 +194,10 @@ main(void)
 	if (test_filetype_dylib() != 0)
 		exit (1);
 	if (test_rpath_info() != 0)
+		exit (1);
+	if (test_relpath_info() != 0)
+		exit (1);
+	if (test_libs_system() != 0)
 		exit (1);
 	printf("PASS\n");
 	return (0);
