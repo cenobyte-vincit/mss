@@ -12,7 +12,7 @@ security-relevant properties — especially code-signing entitlements and
 setuid/setgid permission bits.
 
 The tool is intentionally narrow in its first release: it flags known
-dangerous configurations rather than providing a broad vulnerability catalog.
+dangerous configurations rather than providing a broad vulnerability catalogue.
 
 ## 2. Platform and implementation constraints
 
@@ -57,7 +57,7 @@ usage: mss <path> [-v]
 - Accept a single **file** or **directory**.
 - **Directories** are walked recursively; every file and subdirectory under the target is considered. Enumeration does **not** recurse into symlinks to directories (e.g. a Sparkle cache entry pointing at `/Applications`); symlink targets are still analysed when the symlink itself is enumerated.
 - Enumeration order is deterministic (child paths sorted alphabetically before recursion).
-- Paths are **normalized** when stored and joined (duplicate slashes collapsed;
+- Paths are **normalised** when stored and joined (duplicate slashes collapsed;
   trailing-slash roots such as `/tmp/` must not produce `/tmp//…`).
 - When the user-supplied path differs from its canonical form, both are shown:
   the input path first, then (when the path itself or any path component is a
@@ -144,8 +144,15 @@ A finding is raised when **all** of the following hold:
   `com.apple.security.cs.disable-library-validation` entitlement (without it,
   library validation blocks loading attacker-supplied libraries even from a
   writable rpath).
-- Absolute paths and `@executable_path` / `@loader_path` prefixes are
-  resolved relative to the scanned binary before the permission check.
+- Absolute paths and `@loader_path` prefixes are resolved relative to the
+  scanned binary. `@executable_path` is resolved relative to the directory
+  containing the scanned **MH_EXECUTE** binary; when the scanned file is a
+  non-executable Mach-O inside a `*.app/Contents/…` tree, `@executable_path`
+  is resolved relative to that bundle's main executable in
+  `Contents/MacOS/` (from `Info.plist` `CFBundleExecutable`, or the sole
+  `MH_EXECUTE` in `MacOS/` when unambiguous). If no bundle main executable is
+  found, `@executable_path` falls back to the scanned file's directory (same
+  as `@loader_path` anchor for loadable images).
 
 When a risky `LC_RPATH` directory does not exist, also show yellow **missing**
 and red **creatable** when the current user could create that path. Under
@@ -193,9 +200,10 @@ For **MH_EXECUTE** Mach-O binaries (any Mach-O in verbose mode), resolve
 every linked library install name to a filesystem path:
 
 - Absolute paths are used as-is.
-- `@executable_path`, `@loader_path`, and `@rpath` prefixes are resolved
-  relative to the scanned binary (for `@rpath`, each `LC_RPATH` entry is
-  tried until an existing regular file is found).
+- `@loader_path` and `@rpath` prefixes are resolved relative to the scanned
+  binary; `@executable_path` uses the bundle main-executable directory when
+  the scanned file lies inside `*.app/Contents/…` (see §4.7). For `@rpath`,
+  each `LC_RPATH` entry is tried until an existing regular file is found.
 
 A finding is raised when at least one resolved library exists and is either
 **writable by others** (`S_IWOTH`) or **writable by the current user**
@@ -266,7 +274,7 @@ Directory traversal follows symlinks (e.g. `/tmp` → `/private/tmp`).
 Reported files use a consistent structure:
 
 ```
-<normalized-path>
+<normalised-path>
 	inode                    ← one tab indent, yellow on TTY; shown when findings exist
 		<number>             ← two tab indents
 	<section-header>          ← one tab indent
@@ -383,7 +391,7 @@ The following were discussed but are **not** part of the current deliverable:
 | `.dmg` scanning | Explicitly deferred |
 | `.pkg` scanning | Explicitly deferred |
 | `.app` bundle-specific checks | Directory traversal is sufficient for now |
-| Broad vulnerability catalogs | Beyond Mach-O + named entitlements + setuid/setgid |
+| Broad vulnerability catalogues | Beyond Mach-O + named entitlements + setuid/setgid |
 | Remediation / quarantine / auto-fix | Report only |
 | Cross-platform support | macOS only |
 

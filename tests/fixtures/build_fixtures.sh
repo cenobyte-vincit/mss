@@ -90,6 +90,20 @@ main() {
 	mkdir -p "${OUT}/escape_walk/outside" "${OUT}/escape_walk/scan_here"
 	cp "${OUT}/with_both_ent" "${OUT}/escape_walk/outside/with_both_ent"
 	ln -sfn ../outside "${OUT}/escape_walk/scan_here/escape"
+	mkdir -p "${OUT}/bundle.app/Contents/MacOS" \
+		"${OUT}/bundle.app/Contents/Frameworks"
+	cat >"${OUT}/bundle.app/Contents/Info.plist" <<'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>main</string>
+</dict></plist>
+EOF
+	cp "${OUT}/unsigned" "${OUT}/bundle.app/Contents/MacOS/main"
+	cc -std=c17 -Wall -Wextra -Werror -dynamiclib \
+		-o "${OUT}/bundle.app/Contents/Frameworks/bundled.dylib" \
+		"$hello_c" -Wl,-rpath,@executable_path/Frameworks \
+		-Wl,-rpath,@loader_path/Frameworks
 }
 
 main "$@"

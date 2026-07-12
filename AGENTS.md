@@ -20,7 +20,7 @@ external utilities at scan time.
   `tests/fixtures/build_fixtures.sh` for building signed test inputs.
 - **Report only** — no remediation, quarantine, or auto-fix.
 - **Deferred for v1** — `.dmg`, `.pkg`, JSON output, broad vulnerability
-  catalogs. See REQUIREMENTS.md §6.
+  catalogues. See REQUIREMENTS.md §6.
 
 When behaviour is ambiguous, read REQUIREMENTS.md before guessing.
 

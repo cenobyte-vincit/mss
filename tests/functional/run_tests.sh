@@ -270,6 +270,12 @@ main() {
 	assert_contains "$out" $'\twritable-libraries' t019b
 	assert_contains "$out" 'rel_framework/librel.dylib' t019b
 
+	# t020 bundle dylib: @executable_path uses main executable directory
+	out="$(run_case t020_bundle_rpath 0 "$prog" \
+		"${FIXTURES}/bundle.app/Contents/Frameworks/bundled.dylib" -v)"
+	assert_contains "$out" 'Contents/MacOS/Frameworks' t020
+	assert_contains "$out" 'Contents/Frameworks/Frameworks' t020
+
 	# t013 writable-by-others without sticky bit (default)
 	out="$(run_case t013_unsafe_dir 0 "$prog" "${FIXTURES}/unsafe_dir")"
 	assert_contains "$out" "${FIXTURES}/unsafe_dir" t013

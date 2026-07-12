@@ -19,6 +19,7 @@ typedef struct plist_keys {
 int plist_keys_from_xml(const char *, size_t, plist_keys_t *);
 void plist_keys_free(plist_keys_t *);
 int plist_keys_has(const plist_keys_t *, const char *);
+int plist_string_for_key(const char *, size_t, const char *, char *, size_t);
 
 #ifdef __cplusplus
 }

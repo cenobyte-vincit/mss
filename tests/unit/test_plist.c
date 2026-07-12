@@ -22,6 +22,21 @@ static const char SAMPLE[] =
     "</dict></plist>";
 
 static int
+test_string_for_key(void)
+{
+	char		value[64];
+	const char	*plist =
+	    "<plist><dict>"
+	    "<key>CFBundleExecutable</key><string>main</string>"
+	    "</dict></plist>";
+
+	TEST_ASSERT(plist_string_for_key(plist, strlen(plist),
+	    "CFBundleExecutable", value, sizeof(value)) == 0);
+	TEST_ASSERT(strcmp(value, "main") == 0);
+	return (0);
+}
+
+static int
 test_keys(void)
 {
 	plist_keys_t keys;
@@ -40,6 +55,8 @@ int
 main(void)
 {
 	if (test_keys() != 0)
+		exit (1);
+	if (test_string_for_key() != 0)
 		exit (1);
 	printf("PASS\n");
 	return (0);

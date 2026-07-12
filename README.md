@@ -2,11 +2,16 @@
 
 By cenobyte <vincitamorpatriae@gmail.com> 2026
 
-**mss** is a macOS-only command-line security scanner written in ISO C17. It walks a
-file or directory tree and reports configurations that weaken code signing,
-library loading, or filesystem permissions. Parsing is done entirely in-process
-from Mach-O load commands and embedded code-signature blobs — no `codesign`,
-`otool`, `file`, or other external utilities are invoked at scan time.
+**mss** is a macOS-only command-line security scanner written in ISO C17. It is
+meant to surface **directly exploitable** vulnerabilities and traits in Mach-O
+executables and Application Bundle directories (for example `.app` trees). It
+walks a Mach-O executable or Application Bundle directory path and reports
+misconfigurations in code signing,
+library loading, and filesystem permissions that an attacker can abuse without
+first finding a separate memory-corruption bug. Parsing is done entirely
+in-process from Mach-O load commands and embedded code-signature blobs — no
+`codesign`, `otool`, `file`, or other external utilities are invoked at scan
+time.
 
 ## Build
 
@@ -22,29 +27,49 @@ make
 
 | Argument | Description |
 |----------|-------------|
-| `<path>` | Single file or directory to scan (directories are walked recursively) |
+| `<path>` | Single Mach-O executable or Application Bundle directory to scan (Application Bundle directories are walked recursively) |
 | `-v` | Verbose mode (optional, must be the second argument) |
 
 Exit `0` on success; non-zero with a usage message for bad arguments or scan
 failures.
+
+### Default vs verbose
+
+**Default mode** (no `-v`) is tuned for **direct assessment**: it prints only
+findings that are **immediately exploitable** under current permissions and
+entitlements — writable rpath trees with library validation disabled,
+world-writable linked libraries, relocatable binaries with `disable-library-validation`,
+setuid binaries, and similar. Clean paths produce no output, so you can point
+**mss** at an executable or `.app` and read what matters without wading through
+the whole bundle.
+
+**Verbose mode** (`-v`) is better suited to **broader security audits**: it
+lists every regular file and symlink, full entitlement and library metadata,
+and informational rpath data even when not flagged. Pipe or paste that output
+into **Grok**, **Claude**, or another assistant for deeper review — hunting
+weak configurations, correlating entitlements with linked libraries, or
+building audit notes across a large tree.
 
 ## What it checks
 
 ### Code-signing entitlements (Mach-O)
 
 Entitlements are read from the `LC_CODE_SIGNATURE` superblob and parsed as an
-embedded XML plist. Two keys are treated as dangerous:
+embedded XML plist. Two keys are especially relevant to **library injection and
+process compromise**:
 
-| Entitlement | Risk |
-|-------------|------|
-| `com.apple.security.cs.allow-dyld-environment-variables` | DYLD environment variables can alter library loading |
-| `com.apple.security.cs.disable-library-validation` | Library validation is disabled |
+| Entitlement | Exploitation |
+|-------------|--------------|
+| `com.apple.security.cs.allow-dyld-environment-variables` | Permits DYLD environment variables (for example `DYLD_INSERT_LIBRARIES`) that can force loading of attacker-controlled dynamic libraries |
+| `com.apple.security.cs.disable-library-validation` | Disables library validation, so unsigned or tampered libraries may load; together with other entitlements this can be abused to compromise the target process or system |
 
 **Default mode** reports entitlements on **MH_EXECUTE** binaries when **both**
-dangerous keys are present, or when an **rpath**, **relative-path**, or
+of these keys are present, or when an **rpath**, **relative-path**, or
 **writable-libraries** finding (below) is also raised on that executable. When
-entitlements are shown, **all** keys on the binary are listed, not only the
-dangerous ones. Dylibs are skipped in default mode to reduce noise.
+entitlements are shown, **all** keys on the binary are listed, not only the two
+above — other entitlements (JIT, microphone access, and so on) indicate further
+abuse surface once code execution is gained. Dylibs are skipped in default mode
+to reduce noise.
 
 **Verbose mode** lists entitlements on any Mach-O file that has them.
 
@@ -60,9 +85,9 @@ mode** only when **all** of the following hold:
 - The binary has `com.apple.security.cs.disable-library-validation` (without
   it, planted libraries are not loadable even from a writable rpath).
 
-When a risky rpath directory does not exist, **missing** (informational) and
-**creatable** (when the current user could create it) are also shown, including
-the writable ancestor directory and its permissions.
+When an exploitable rpath directory does not exist, **missing** (informational)
+and **creatable** (when the current user could create it) are also shown,
+including the writable ancestor directory and its permissions.
 
 **Verbose mode** lists rpath data for any Mach-O with `LC_RPATH` and/or
 `@rpath` dependencies; the header is red only when the writable-rpath
@@ -110,12 +135,17 @@ mode** uses the same rules.
 ### setuid / setgid
 
 Regular files (including symlink targets) with the setuid and/or setgid bit set
-are reported with symbolic mode, octal permissions, and owner/group.
+are reported with symbolic mode, octal permissions, and owner/group. These bits
+mean the programme **can** run with elevated privileges; **mss** does not look
+for conventional implementation flaws. It is up to you to audit the binary for
+memory-corruption bugs (buffer overflows, format-string issues), unsafe
+`system()` or `popen()` use, `PATH` hijacking, predictable temporary files,
+and similar classic privilege-escalation paths.
 
-### World-writable files and directories
+### World-writable files and Application Bundle directories
 
-Files writable by others (`S_IWOTH`) are reported. Scan-root directories
-writable by others are reported with **writable-by-others, sticky bit** and
+Files writable by others (`S_IWOTH`) are reported. Scan-root Application Bundle
+directories writable by others are reported with **writable-by-others, sticky bit** and
 mode details (sticky status appears in the mode string when set).
 
 ### Symlinks
@@ -137,7 +167,7 @@ mode details (sticky status appears in the mode string when set).
 
 ### Mach-O detection
 
-Thin and universal (fat) Mach-O binaries are recognized. Non-Mach-O files may
+Thin and universal (fat) Mach-O binaries are recognised. Non-Mach-O files may
 still be reported for permission findings. **Verbose mode** adds a **libraries**
 section (all linked dylib install names), then `KIND:` and `MACHO:` metadata
 per object.
@@ -156,7 +186,7 @@ Typical layout:
 	<resolved-path>
 	inode
 		<number>
-	entitlements             ← red when dangerous keys present (or load-flagged)
+	entitlements             ← red when exploitable keys present (or load-flagged)
 		<key>
 	rpath
 		<LC_RPATH entry>
@@ -178,10 +208,12 @@ Typical layout:
 	setuid / setgid / writable-by-others …
 ```
 
-**Default mode** prints only objects with findings (silent on clean trees).
+**Default mode** prints only **immediately exploitable** findings (silent on
+clean trees) — see [Default vs verbose](#default-vs-verbose) above.
 **Verbose mode** prints every regular file and symlink under the target, plus
-the scan-root directory; subdirectories discovered during walks are not listed
-separately.
+the scan-root Application Bundle directory; subdirectories discovered during
+walks of Application Bundle directories are not listed separately. Use `-v` when
+you want a full inventory to analyse offline or with an LLM assistant.
 
 ### Example (default, relative-path + writable libraries)
 
@@ -257,7 +289,6 @@ See [REQUIREMENTS.md](REQUIREMENTS.md) for the full behavioural specification.
 
 ## Limitations
 
-- macOS only; no `.dmg` or `.pkg` handling (yet) beyond normal directory traversal.
+- macOS only; no `.dmg` or `.pkg` handling (yet) beyond normal Application Bundle directory traversal.
 - Report-only — no remediation or quarantine.
 - Human-oriented text output (no JSON mode).
-

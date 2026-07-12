@@ -9,6 +9,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <grp.h>
 #include <libgen.h>
 #include <limits.h>
@@ -600,6 +601,12 @@ scan_entitlements_findings(const char *path, int verbose, int load_flagged,
 	return (0);
 }
 
+typedef struct scan_macho_ctx {
+	char	scanned_path[PATH_MAX];
+	char	loader_dir[PATH_MAX];
+	char	executable_dir[PATH_MAX];
+} scan_macho_ctx_t;
+
 static int
 scan_dirname_last(char *path)
 {
@@ -675,33 +682,187 @@ scan_lib_is_risky(const char *path, const struct stat *st)
 }
 
 static int
-scan_rpath_resolve(const char *rpath, const char *macho_path, char *out,
-    size_t outlen)
+scan_bundle_macos_dir(const char *path, char *out, size_t outlen)
+{
+	const char	*last;
+	const char	*marker;
+	size_t		prefix;
+
+	last = NULL;
+	for (marker = path; (marker = strstr(marker, ".app/Contents/")) != NULL;
+	    last = marker, marker++)
+		;
+	if (last == NULL)
+		return (-1);
+	prefix = (size_t)(last - path) + (size_t)4;
+	if (snprintf(out, outlen, "%.*s/Contents/MacOS", (int)prefix,
+	    path) >= (int)outlen)
+		return (-1);
+	return (0);
+}
+
+static int
+scan_bundle_main_from_plist(const char *macos_dir, char *out, size_t outlen)
+{
+	char		contents[PATH_MAX];
+	char		exec_name[PATH_MAX];
+	char		*data;
+	macho_filetype_t	ftype;
+	size_t		len;
+	ssize_t		nread;
+	int		fd;
+
+	if (snprintf(contents, sizeof(contents), "%s/../Info.plist",
+	    macos_dir) >= (int)sizeof(contents))
+		return (-1);
+	scan_collapse_slashes(contents);
+	fd = open(contents, O_RDONLY);
+	if (fd < 0)
+		return (-1);
+	data = NULL;
+	len = 0;
+	for (;;) {
+		char	*grown;
+
+		grown = realloc(data, len + 4096);
+		if (grown == NULL) {
+			free(data);
+			close(fd);
+			return (-1);
+		}
+		data = grown;
+		nread = read(fd, data + len, 4096);
+		if (nread < 0) {
+			free(data);
+			close(fd);
+			return (-1);
+		}
+		if (nread == 0)
+			break;
+		len += (size_t)nread;
+	}
+	close(fd);
+	if (len == 0) {
+		free(data);
+		return (-1);
+	}
+	if (plist_string_for_key(data, len, "CFBundleExecutable", exec_name,
+	    sizeof(exec_name)) != 0) {
+		free(data);
+		return (-1);
+	}
+	free(data);
+	if (snprintf(out, outlen, "%s/%s", macos_dir, exec_name) >= (int)outlen)
+		return (-1);
+	if (macho_filetype_of(out, &ftype) != 0 || ftype != MACHO_FILE_EXECUTE)
+		return (-1);
+	return (0);
+}
+
+static int
+scan_bundle_main_from_macos(const char *macos_dir, char *out, size_t outlen)
+{
+	DIR		*dir;
+	macho_filetype_t	ftype;
+	struct dirent	*entry;
+	char		candidate[PATH_MAX];
+	int		count;
+
+	dir = opendir(macos_dir);
+	if (dir == NULL)
+		return (-1);
+	count = 0;
+	while ((entry = readdir(dir)) != NULL) {
+		if (entry->d_name[0] == '.')
+			continue;
+		if (snprintf(candidate, sizeof(candidate), "%s/%s", macos_dir,
+		    entry->d_name) >= (int)sizeof(candidate))
+			continue;
+		if (macho_filetype_of(candidate, &ftype) != 0 ||
+		    ftype != MACHO_FILE_EXECUTE)
+			continue;
+		if (strlcpy(out, candidate, outlen) >= outlen) {
+			closedir(dir);
+			return (-1);
+		}
+		count++;
+		if (count > 1) {
+			closedir(dir);
+			return (-1);
+		}
+	}
+	closedir(dir);
+	return (count == 1 ? 0 : -1);
+}
+
+static int
+scan_bundle_main_executable(const char *path, char *out, size_t outlen)
+{
+	char	macos_dir[PATH_MAX];
+
+	if (scan_bundle_macos_dir(path, macos_dir, sizeof(macos_dir)) != 0)
+		return (-1);
+	if (scan_bundle_main_from_plist(macos_dir, out, outlen) == 0)
+		return (0);
+	return (scan_bundle_main_from_macos(macos_dir, out, outlen));
+}
+
+static void
+scan_macho_ctx_fill(const char *path, scan_macho_ctx_t *ctx)
 {
 	char		dirpath[PATH_MAX];
+	char		exe_path[PATH_MAX];
 	char		*dir;
+	macho_filetype_t	ftype;
+
+	memset(ctx, 0, sizeof(*ctx));
+	strlcpy(ctx->scanned_path, path, sizeof(ctx->scanned_path));
+	strlcpy(dirpath, path, sizeof(dirpath));
+	dir = dirname(dirpath);
+	strlcpy(ctx->loader_dir, dir, sizeof(ctx->loader_dir));
+	if (macho_filetype_of(path, &ftype) == 0 &&
+	    ftype == MACHO_FILE_EXECUTE) {
+		strlcpy(ctx->executable_dir, ctx->loader_dir,
+		    sizeof(ctx->executable_dir));
+		return;
+	}
+	if (scan_bundle_main_executable(path, exe_path, sizeof(exe_path)) == 0) {
+		strlcpy(dirpath, exe_path, sizeof(dirpath));
+		dir = dirname(dirpath);
+		strlcpy(ctx->executable_dir, dir, sizeof(ctx->executable_dir));
+		return;
+	}
+	strlcpy(ctx->executable_dir, ctx->loader_dir,
+	    sizeof(ctx->executable_dir));
+}
+
+static int
+scan_rpath_resolve(const char *rpath, const scan_macho_ctx_t *ctx, char *out,
+    size_t outlen)
+{
+	const char	*base;
 	const char	*suffix;
 
-	if (strncmp(rpath, "@executable_path", 16) == 0)
+	if (strncmp(rpath, "@executable_path", 16) == 0) {
+		base = ctx->executable_dir;
 		suffix = rpath + 16;
-	else if (strncmp(rpath, "@loader_path", 12) == 0)
+	} else if (strncmp(rpath, "@loader_path", 12) == 0) {
+		base = ctx->loader_dir;
 		suffix = rpath + 12;
-	else if (rpath[0] == '/')
+	} else if (rpath[0] == '/') {
 		return (strlcpy(out, rpath, outlen) < outlen ? 0 : -1);
-	else
+	} else
 		return (-1);
 	if (*suffix == '\0')
 		suffix = "";
-	strlcpy(dirpath, macho_path, sizeof(dirpath));
-	dir = dirname(dirpath);
-	if (snprintf(out, outlen, "%s%s", dir, suffix) >= (int)outlen)
+	if (snprintf(out, outlen, "%s%s", base, suffix) >= (int)outlen)
 		return (-1);
 	scan_collapse_slashes(out);
 	return (0);
 }
 
 static int
-scan_lib_resolve(const char *name, const char *macho_path,
+scan_lib_resolve(const char *name, const scan_macho_ctx_t *ctx,
     const macho_rpath_info_t *rpath_info, char *out, size_t outlen)
 {
 	char		base[PATH_MAX];
@@ -715,8 +876,8 @@ scan_lib_resolve(const char *name, const char *macho_path,
 		if (strlcpy(rest, name + 7, sizeof(rest)) >= sizeof(rest))
 			return (-1);
 		for (i = 0; i < rpath_info->rpaths.count; i++) {
-			if (scan_rpath_resolve(rpath_info->rpaths.items[i],
-			    macho_path, base, sizeof(base)) != 0)
+			if (scan_rpath_resolve(rpath_info->rpaths.items[i], ctx,
+			    base, sizeof(base)) != 0)
 				continue;
 			if (snprintf(out, outlen, "%s/%s", base, rest) >=
 			    (int)outlen)
@@ -727,7 +888,7 @@ scan_lib_resolve(const char *name, const char *macho_path,
 		}
 		return (-1);
 	}
-	if (scan_rpath_resolve(name, macho_path, out, outlen) != 0)
+	if (scan_rpath_resolve(name, ctx, out, outlen) != 0)
 		return (-1);
 	if (stat(out, &st) != 0 || !S_ISREG(st.st_mode))
 		return (-1);
@@ -735,7 +896,7 @@ scan_lib_resolve(const char *name, const char *macho_path,
 }
 
 static int
-scan_lib_findings(const char *path, int verbose,
+scan_lib_findings(const char *path, int verbose, const scan_macho_ctx_t *ctx,
     const macho_rpath_info_t *load_info, scan_writable_libs_t *out,
     int *flagged)
 {
@@ -758,7 +919,7 @@ scan_lib_findings(const char *path, int verbose,
 		return (0);
 	}
 	for (i = 0; i < libs.count; i++) {
-		if (scan_lib_resolve(libs.items[i], path, load_info, resolved,
+		if (scan_lib_resolve(libs.items[i], ctx, load_info, resolved,
 		    sizeof(resolved)) != 0)
 			continue;
 		if (stat(resolved, &st) != 0 || !S_ISREG(st.st_mode))
@@ -799,14 +960,15 @@ scan_rpath_dir_risky(const char *rpath)
 }
 
 static int
-scan_rpath_has_risky(const char *macho_path, const macho_rpath_info_t *info)
+scan_rpath_has_risky(const scan_macho_ctx_t *ctx,
+    const macho_rpath_info_t *info)
 {
 	char	resolved[PATH_MAX];
 	size_t	i;
 
 	for (i = 0; i < info->rpaths.count; i++) {
-		if (scan_rpath_resolve(info->rpaths.items[i], macho_path,
-		    resolved, sizeof(resolved)) != 0)
+		if (scan_rpath_resolve(info->rpaths.items[i], ctx, resolved,
+		    sizeof(resolved)) != 0)
 			continue;
 		if (scan_rpath_dir_risky(resolved))
 			return (1);
@@ -838,9 +1000,9 @@ scan_has_entitlement(const char *path, const char *key)
 }
 
 static int
-scan_load_findings(const char *path, int verbose, macho_rpath_info_t *info,
-    int *rpath_findings, int *rpath_flagged, int *relpath_findings,
-    int *relpath_flagged)
+scan_load_findings(const char *path, int verbose, const scan_macho_ctx_t *ctx,
+    macho_rpath_info_t *info, int *rpath_findings, int *rpath_flagged,
+    int *relpath_findings, int *relpath_flagged)
 {
 	macho_filetype_t	ftype;
 	int			has_lv;
@@ -860,7 +1022,7 @@ scan_load_findings(const char *path, int verbose, macho_rpath_info_t *info,
 	}
 	if (macho_rpath_info_for_path(path, info) <= 0)
 		return (0);
-	has_risky = scan_rpath_has_risky(path, info);
+	has_risky = scan_rpath_has_risky(ctx, info);
 	has_lv = scan_has_entitlement(path, ENT_DISABLE_LV);
 	if (verbose) {
 		if (info->rpaths.count > 0 || info->deps.count > 0) {
@@ -1144,10 +1306,10 @@ scan_print_creatable_target(const char *target)
 }
 
 static int
-scan_rpath_entry_risky(const char *rpath, const char *macho_path,
+scan_rpath_entry_risky(const char *rpath, const scan_macho_ctx_t *ctx,
     char *resolved, size_t reslen)
 {
-	if (scan_rpath_resolve(rpath, macho_path, resolved, reslen) != 0)
+	if (scan_rpath_resolve(rpath, ctx, resolved, reslen) != 0)
 		return (0);
 	return (scan_rpath_dir_risky(resolved));
 }
@@ -1198,8 +1360,8 @@ scan_print_relpath_list(const macho_rpath_info_t *info, int flagged)
 }
 
 static void
-scan_print_rpath_list(const macho_rpath_info_t *info, const char *macho_path,
-    int verbose, int flagged)
+scan_print_rpath_list(const macho_rpath_info_t *info,
+    const scan_macho_ctx_t *ctx, int verbose, int flagged)
 {
 	struct stat	st;
 	char		resolved[PATH_MAX];
@@ -1209,7 +1371,7 @@ scan_print_rpath_list(const macho_rpath_info_t *info, const char *macho_path,
 	shown = 0;
 	for (i = 0; i < info->rpaths.count; i++) {
 		if (!verbose &&
-		    !scan_rpath_entry_risky(info->rpaths.items[i], macho_path,
+		    !scan_rpath_entry_risky(info->rpaths.items[i], ctx,
 		    resolved, sizeof(resolved)))
 			continue;
 		if (!shown) {
@@ -1229,11 +1391,11 @@ scan_print_rpath_list(const macho_rpath_info_t *info, const char *macho_path,
 		return;
 	for (i = 0; i < info->rpaths.count; i++) {
 		if (!verbose &&
-		    !scan_rpath_entry_risky(info->rpaths.items[i], macho_path,
+		    !scan_rpath_entry_risky(info->rpaths.items[i], ctx,
 		    resolved, sizeof(resolved)))
 			continue;
-		if (scan_rpath_resolve(info->rpaths.items[i], macho_path,
-		    resolved, sizeof(resolved)) != 0)
+		if (scan_rpath_resolve(info->rpaths.items[i], ctx, resolved,
+		    sizeof(resolved)) != 0)
 			continue;
 		if (stat(resolved, &st) == 0 && S_ISDIR(st.st_mode))
 			continue;
@@ -1264,6 +1426,7 @@ scan_file_findings(const char *path, int verbose, const struct stat *st)
 {
 	macho_rpath_info_t	load_info;
 	plist_keys_t		keys;
+	scan_macho_ctx_t	mctx;
 	scan_writable_libs_t	writable_libs;
 	int			ent_flagged;
 	int			ent_findings;
@@ -1281,9 +1444,10 @@ scan_file_findings(const char *path, int verbose, const struct stat *st)
 	has_findings = 0;
 	has_setid = scan_has_setid(st);
 	world_writable = scan_has_world_writable(st);
-	scan_load_findings(path, verbose, &load_info, &rpath_findings,
+	scan_macho_ctx_fill(path, &mctx);
+	scan_load_findings(path, verbose, &mctx, &load_info, &rpath_findings,
 	    &rpath_flagged, &relpath_findings, &relpath_flagged);
-	lib_findings = scan_lib_findings(path, verbose, &load_info,
+	lib_findings = scan_lib_findings(path, verbose, &mctx, &load_info,
 	    &writable_libs, &lib_flagged);
 	load_flagged = rpath_flagged || relpath_flagged || lib_flagged;
 	ent_findings = scan_entitlements_findings(path, verbose, load_flagged,
@@ -1321,7 +1485,7 @@ scan_file_findings(const char *path, int verbose, const struct stat *st)
 	if (ent_findings)
 		scan_print_entitlements_list(&keys, ent_flagged);
 	if (rpath_findings)
-		scan_print_rpath_list(&load_info, path, verbose, rpath_flagged);
+		scan_print_rpath_list(&load_info, &mctx, verbose, rpath_flagged);
 	if (relpath_findings)
 		scan_print_relpath_list(&load_info, relpath_flagged);
 	if (lib_findings)
@@ -1395,6 +1559,7 @@ scan_file(const char *path, int verbose)
 {
 	macho_rpath_info_t	load_info;
 	plist_keys_t		keys;
+	scan_macho_ctx_t	mctx;
 	scan_writable_libs_t	writable_libs;
 	struct stat		lst;
 	struct stat		st;
@@ -1418,9 +1583,10 @@ scan_file(const char *path, int verbose)
 		return (0);
 	has_setid = scan_has_setid(&st);
 	world_writable = scan_has_world_writable(&st);
-	scan_load_findings(path, verbose, &load_info, &rpath_findings,
+	scan_macho_ctx_fill(path, &mctx);
+	scan_load_findings(path, verbose, &mctx, &load_info, &rpath_findings,
 	    &rpath_flagged, &relpath_findings, &relpath_flagged);
-	lib_findings = scan_lib_findings(path, verbose, &load_info,
+	lib_findings = scan_lib_findings(path, verbose, &mctx, &load_info,
 	    &writable_libs, &lib_flagged);
 	load_flagged = rpath_flagged || relpath_flagged || lib_flagged;
 	ent_findings = scan_entitlements_findings(path, verbose, load_flagged,

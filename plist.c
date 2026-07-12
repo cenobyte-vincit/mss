@@ -4,6 +4,7 @@
 
 #include "plist.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -87,6 +88,51 @@ plist_keys_free(plist_keys_t *keys)
 	free(keys->keys);
 	keys->keys = NULL;
 	keys->count = 0;
+}
+
+static const char *
+plist_skip_space(const char *p, const char *end)
+{
+	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
+		p++;
+	return (p);
+}
+
+int
+plist_string_for_key(const char *xml, size_t len, const char *key, char *out,
+    size_t outlen)
+{
+	char		keytag[256];
+	const char	*end;
+	const char	*key_open;
+	const char	*keytag_end;
+	const char	*str_close;
+	const char	*str_open;
+	size_t		vlen;
+
+	if (xml == NULL || key == NULL || out == NULL || outlen == 0)
+		return (-1);
+	if (snprintf(keytag, sizeof(keytag), "<key>%s</key>", key) >=
+	    (int)sizeof(keytag))
+		return (-1);
+	end = xml + len;
+	key_open = strstr(xml, keytag);
+	if (key_open == NULL || key_open >= end)
+		return (-1);
+	keytag_end = key_open + strlen(keytag);
+	str_open = plist_skip_space(keytag_end, end);
+	if (str_open + 8 > end || memcmp(str_open, "<string>", 8) != 0)
+		return (-1);
+	str_open += 8;
+	str_close = strstr(str_open, "</string>");
+	if (str_close == NULL || str_close >= end || str_close <= str_open)
+		return (-1);
+	vlen = (size_t)(str_close - str_open);
+	if (vlen + 1 > outlen)
+		return (-1);
+	memcpy(out, str_open, vlen);
+	out[vlen] = '\0';
+	return (0);
 }
 
 int
