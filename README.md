@@ -41,10 +41,10 @@ embedded XML plist. Two keys are treated as dangerous:
 | `com.apple.security.cs.disable-library-validation` | Library validation is disabled |
 
 **Default mode** reports entitlements on **MH_EXECUTE** binaries when **both**
-dangerous keys are present, or when an **rpath** finding (below) is also raised
-on that executable. When entitlements are shown, **all** keys on the binary are
-listed, not only the dangerous ones. Dylibs are skipped in default mode to
-reduce noise.
+dangerous keys are present, or when an **rpath**, **relative-path**, or
+**writable-libraries** finding (below) is also raised on that executable. When
+entitlements are shown, **all** keys on the binary are listed, not only the
+dangerous ones. Dylibs are skipped in default mode to reduce noise.
 
 **Verbose mode** lists entitlements on any Mach-O file that has them.
 
@@ -67,6 +67,45 @@ the writable ancestor directory and its permissions.
 **Verbose mode** lists rpath data for any Mach-O with `LC_RPATH` and/or
 `@rpath` dependencies; the header is red only when the writable-rpath
 combination is present (the entitlement is not required for listing).
+
+`@executable_path` and `@loader_path` prefixes are resolved relative to the
+scanned binary when checking `LC_RPATH` directories.
+
+### `@executable_path` and `@loader_path` (Mach-O executables)
+
+For each executable, **mss** parses linked libraries whose install names start
+with `@executable_path` or `@loader_path`. A finding is raised in **default
+mode** only when **all** of the following hold:
+
+- At least one such dependency exists.
+- The binary has `com.apple.security.cs.disable-library-validation` (without
+  it, library validation blocks loading attacker-supplied libraries even when
+  the binary is copied to an attacker-controlled directory tree).
+
+Without library validation, an attacker who can place the executable in a
+chosen location can reconstruct the relative directory layout those install
+names resolve to and supply malicious dylibs.
+
+When a **relative-path** finding is raised, **all** entitlement keys on that
+executable are also listed. **Verbose mode** lists `relative-path` data for any
+Mach-O with `@executable_path` and/or `@loader_path` dependencies; the header
+is red only when `disable-library-validation` is also present.
+
+### Writable linked libraries (Mach-O executables)
+
+For each executable, **mss** resolves every linked library install name to a
+filesystem path (absolute paths as-is; `@executable_path`, `@loader_path`, and
+`@rpath` relative to the scanned binary). A finding is raised when at least one
+resolved library exists and is either **writable by others** (`S_IWOTH`) or
+**writable by the current user** through group permission bits (`S_IWGRP` and
+`access(2)` `W_OK`). Owner-only write permission alone is not flagged.
+
+Each match is shown under a red **writable-libraries** header: the resolved
+path, then a mode detail line (`<symbolic-mode> <octal> <owner:group>`). When
+no passwd or group entry exists, the numeric UID or GID is shown instead of a
+name. When a **writable-libraries** finding is raised in default mode, **all**
+entitlement keys on that executable are also listed when present. **Verbose
+mode** uses the same rules.
 
 ### setuid / setgid
 
@@ -99,8 +138,9 @@ mode details (sticky status appears in the mode string when set).
 ### Mach-O detection
 
 Thin and universal (fat) Mach-O binaries are recognized. Non-Mach-O files may
-still be reported for permission findings. Verbose mode adds `KIND:` and
-`MACHO:` metadata per object.
+still be reported for permission findings. **Verbose mode** adds a **libraries**
+section (all linked dylib install names), then `KIND:` and `MACHO:` metadata
+per object.
 
 ## Output
 
@@ -116,11 +156,18 @@ Typical layout:
 	<resolved-path>
 	inode
 		<number>
-	entitlements             ← red when dangerous keys present (or rpath-flagged)
+	entitlements             ← red when dangerous keys present (or load-flagged)
 		<key>
 	rpath
 		<LC_RPATH entry>
 		<@rpath dependency>
+	relative-path
+		<@executable_path or @loader_path dependency>
+	writable-libraries
+		<resolved library path>
+		<mode> <octal> <owner:group>
+	libraries                ← verbose only; install names, not red
+		<install name>
 	missing
 		<path>
 		<resolved-path>      ← when path contains ../
@@ -135,6 +182,22 @@ Typical layout:
 **Verbose mode** prints every regular file and symlink under the target, plus
 the scan-root directory; subdirectories discovered during walks are not listed
 separately.
+
+### Example (default, relative-path + writable libraries)
+
+```
+/Applications/Example.app/Contents/MacOS/Example
+	inode
+		12345678
+	entitlements
+		com.apple.security.cs.disable-library-validation
+		…
+	relative-path
+		@executable_path/../Frameworks/libexample.dylib
+	writable-libraries
+		/Applications/Example.app/Contents/Frameworks/libexample.dylib
+		-rwxrwxrwx 0777 echobravo:admin
+```
 
 ### Example (default, rpath + entitlements)
 
