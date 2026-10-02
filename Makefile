@@ -13,6 +13,18 @@ CPPCHECK ?= cppcheck
 CFLAGS ?= -std=c17 -Wall -Wextra -Werror -pedantic -I.
 LDFLAGS ?=
 
+# Prefer the selected toolchain's MacOSX.sdk symlink. xcrun --show-sdk-path
+# can return a newer numbered SDK whose TBD files name architectures the
+# installed ld does not know (for example arm64e.x1).
+DEVDIR := $(shell xcode-select -p)
+SDKROOT ?= $(firstword $(wildcard \
+	$(DEVDIR)/SDKs/MacOSX.sdk \
+	$(DEVDIR)/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk))
+ifeq ($(SDKROOT),)
+SDKROOT := $(shell xcrun --sdk macosx --show-sdk-path)
+endif
+export SDKROOT
+
 .PHONY: all clean test test-unit test-functional check lint \
 	fixtures check-cppcheck
 
